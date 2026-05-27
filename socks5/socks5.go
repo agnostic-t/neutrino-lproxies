@@ -9,7 +9,6 @@ import (
 	"slices"
 	"strconv"
 
-	// Импортируем ядро, чтобы компилятор проверял соответствие интерфейсам
 	"github.com/agnostic-t/neutrino-core/local"
 )
 
