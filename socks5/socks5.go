@@ -71,7 +71,7 @@ func (p *Proxy) Close() error {
 
 // ==========================================
 
-// Request реализует local.Request
+// Request implements local.Request
 type Request struct {
 	conn   net.Conn
 	target string
