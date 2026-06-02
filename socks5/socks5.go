@@ -1,6 +1,7 @@
 package socks5
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -38,13 +39,16 @@ type Proxy struct {
 	reqChan  chan local.Request
 	udpFlows map[string]net.Conn
 	udpMutex sync.Mutex
+
+	ctx context.Context
 }
 
-func NewProxy(bindAddr string) *Proxy {
+func NewProxy(bindAddr string, ctx context.Context) *Proxy {
 	return &Proxy{
 		bindAddr: bindAddr,
 		reqChan:  make(chan local.Request, 1024),
 		udpFlows: make(map[string]net.Conn),
+		ctx:      ctx,
 	}
 }
 
@@ -70,11 +74,15 @@ func (p *Proxy) Listen() error {
 }
 
 func (p *Proxy) Accept() (local.Request, error) {
-	req, ok := <-p.reqChan
-	if !ok {
-		return nil, io.EOF
+	select {
+	case req, ok := <-p.reqChan:
+		if !ok {
+			return nil, io.EOF
+		}
+		return req, nil
+	case <-p.ctx.Done():
+		return nil, net.ErrClosed
 	}
-	return req, nil
 }
 
 func (p *Proxy) Close() error {
