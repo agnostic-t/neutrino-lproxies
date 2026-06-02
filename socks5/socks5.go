@@ -388,10 +388,15 @@ func parseRequest(conn net.Conn) (string, error, RequestProto) {
 	port := binary.BigEndian.Uint16(portBuf)
 
 	var reqProtoType RequestProto = REQUEST_UNKNOWN_PROTO
-	if cmd == 0x01 {
+	switch cmd {
+	case 0x01:
 		reqProtoType = REQUEST_TCP
-	} else if cmd == 0x03 {
+	case 0x03:
 		reqProtoType = REQUEST_UDP
+	}
+
+	if reqProtoType == REQUEST_UNKNOWN_PROTO {
+		return "", fmt.Errorf("Unknown protocol: %d", cmd), REQUEST_UNKNOWN_PROTO
 	}
 
 	return net.JoinHostPort(host, fmt.Sprintf("%d", port)), nil, reqProtoType
