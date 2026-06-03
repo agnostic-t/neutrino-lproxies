@@ -33,12 +33,19 @@ const (
 	REQUEST_UDP
 )
 
+const udpTimeout = 60 * time.Second
+
+type udpFlow struct {
+	conn  net.Conn
+	timer *time.Timer
+}
+
 type Proxy struct {
 	bindAddr string
 	listener net.Listener
 
 	reqChan  chan local.Request
-	udpFlows map[string]net.Conn
+	udpFlows map[string]*udpFlow
 	udpMutex sync.Mutex
 
 	ctx context.Context
@@ -48,7 +55,7 @@ func NewProxy(bindAddr string, ctx context.Context) *Proxy {
 	return &Proxy{
 		bindAddr: bindAddr,
 		reqChan:  make(chan local.Request, 1024),
-		udpFlows: make(map[string]net.Conn),
+		udpFlows: make(map[string]*udpFlow),
 		ctx:      ctx,
 	}
 }
@@ -111,36 +118,47 @@ func (p *Proxy) handleInitConn(conn net.Conn) {
 	}
 
 	if reqProto == REQUEST_UDP {
-		udpAddr, _ := net.ResolveUDPAddr("udp", "0.0.0.0:0") // ИСПРАВЛЕНО
+		udpAddr, _ := net.ResolveUDPAddr("udp", "0.0.0.0:0")
 		udpConn, err := net.ListenUDP("udp", udpAddr)
 		if err != nil {
 			sendReply(conn, 0x01, "0.0.0.0:0")
 			return
 		}
 
-		go p.handleUDP(udpConn, conn)
+		localAddr := udpConn.LocalAddr().(*net.UDPAddr)
+		sendReply(conn, 0x00, fmt.Sprintf("0.0.0.0:%d", localAddr.Port))
 
-		p.reqChan <- &Request{
-			conn:    conn,
-			target:  target,
-			proto:   "udp",
-			udpConn: udpConn,
-		}
+		go p.handleUDP(udpConn, conn)
 	}
 }
 
 func (p *Proxy) handleUDP(udpConn *net.UDPConn, tcpControlConn net.Conn) {
-	defer udpConn.Close()
-	defer tcpControlConn.Close()
+	sessionFlows := make(map[string]struct{})
+	var sessionMutex sync.Mutex
+
+	defer func() {
+		udpConn.Close()
+		tcpControlConn.Close()
+
+		p.udpMutex.Lock()
+		sessionMutex.Lock()
+		for flowKey := range sessionFlows {
+			if flow, exists := p.udpFlows[flowKey]; exists {
+				flow.timer.Stop()
+				flow.conn.Close()
+				delete(p.udpFlows, flowKey)
+			}
+		}
+		sessionMutex.Unlock()
+		p.udpMutex.Unlock()
+	}()
 
 	tcpClosed := make(chan struct{})
 	go func() {
 		defer close(tcpClosed)
 		buf := make([]byte, 1)
-
 		for {
-			_, err := tcpControlConn.Read(buf)
-			if err != nil {
+			if _, err := tcpControlConn.Read(buf); err != nil {
 				return
 			}
 		}
@@ -157,7 +175,7 @@ func (p *Proxy) handleUDP(udpConn *net.UDPConn, tcpControlConn net.Conn) {
 				case <-tcpClosed:
 					return
 				default:
-					continue // timeout
+					continue
 				}
 			}
 			return
@@ -172,12 +190,35 @@ func (p *Proxy) handleUDP(udpConn *net.UDPConn, tcpControlConn net.Conn) {
 		flowKey := clientAddr.String() + "-" + target
 
 		p.udpMutex.Lock()
-		virtualConn, exists := p.udpFlows[flowKey]
+		flow, exists := p.udpFlows[flowKey]
 
 		if !exists {
+			// fmt.Println("New UDP flow:", flowKey)
 			left, right := net.Pipe()
-			p.udpFlows[flowKey] = right
-			virtualConn = right
+
+			timer := time.AfterFunc(udpTimeout, func() {
+				p.udpMutex.Lock()
+				if f, ok := p.udpFlows[flowKey]; ok {
+					f.conn.Close() // closing VPN connection
+					delete(p.udpFlows, flowKey)
+				}
+				p.udpMutex.Unlock()
+
+				sessionMutex.Lock()
+				delete(sessionFlows, flowKey)
+				sessionMutex.Unlock()
+				// fmt.Println("UDP flow closed by timeout:", flowKey)
+			})
+
+			flow = &udpFlow{
+				conn:  right,
+				timer: timer,
+			}
+			p.udpFlows[flowKey] = flow
+
+			sessionMutex.Lock()
+			sessionFlows[flowKey] = struct{}{}
+			sessionMutex.Unlock()
 
 			p.reqChan <- &Request{
 				conn:   left,
@@ -194,18 +235,32 @@ func (p *Proxy) handleUDP(udpConn *net.UDPConn, tcpControlConn net.Conn) {
 						break
 					}
 
+					flow.timer.Reset(udpTimeout)
+
 					header := buildSocks5UDPHeader(target)
+					if header == nil {
+						continue
+					}
 					udpConn.WriteToUDP(append(header, respBuf[:rn]...), clientAddr)
 				}
 
 				p.udpMutex.Lock()
-				delete(p.udpFlows, flowKey)
+				if f, ok := p.udpFlows[flowKey]; ok && f.conn == right {
+					f.timer.Stop()
+					delete(p.udpFlows, flowKey)
+				}
 				p.udpMutex.Unlock()
+
+				sessionMutex.Lock()
+				delete(sessionFlows, flowKey)
+				sessionMutex.Unlock()
 			}()
+		} else {
+			flow.timer.Reset(udpTimeout)
 		}
 		p.udpMutex.Unlock()
 
-		virtualConn.Write(payload)
+		flow.conn.Write(payload)
 	}
 }
 
@@ -231,7 +286,7 @@ func parseSocks5UDPHeader(buf []byte) (string, int, error) {
 		}
 		host = net.IP(buf[offset : offset+4]).String()
 		offset += 4
-
+		fmt.Println("Got IPv4 on UDP:", host)
 	case 0x03: // Domain Name: 1 byte length + domain name
 		if len(buf) < offset+1 {
 			return "", 0, fmt.Errorf("packet too short for Domain")
@@ -316,17 +371,13 @@ func (r *Request) Proto() string {
 }
 
 func (r *Request) Success(boundAddr string) (net.Conn, error) {
-	addr := boundAddr
-	if r.proto == "udp" && r.udpConn != nil {
-		addr = r.udpConn.LocalAddr().String()
+	if r.proto == "udp" {
+		return r.conn, nil
 	}
 
+	addr := "0.0.0.0:0"
 	if err := sendReply(r.conn, 0x00, addr); err != nil {
 		return nil, fmt.Errorf("reply error: %s, %w", r.conn.RemoteAddr(), err)
-	}
-
-	if r.proto == "udp" {
-		return nil, nil
 	}
 
 	return r.conn, nil
@@ -384,7 +435,7 @@ func parseRequest(conn net.Conn) (string, error, RequestProto) {
 		return "", err, REQUEST_UNKNOWN_PROTO
 	}
 
-	// If not CONNECT
+	// If not SOCKS5
 	if header[0] != 0x05 {
 		sendReply(conn, 0x05, "0.0.0.0:0")
 		return "", fmt.Errorf("Wrong SOCKS version: %d", header[0]), REQUEST_UNKNOWN_PROTO
