@@ -117,19 +117,25 @@ func (p *Proxy) handleInitConn(conn net.Conn) {
 		return
 	}
 
-	if reqProto == REQUEST_UDP {
-		udpAddr, _ := net.ResolveUDPAddr("udp", "0.0.0.0:0")
-		udpConn, err := net.ListenUDP("udp", udpAddr)
-		if err != nil {
-			sendReply(conn, 0x01, "0.0.0.0:0")
-			return
-		}
-
-		localAddr := udpConn.LocalAddr().(*net.UDPAddr)
-		sendReply(conn, 0x00, fmt.Sprintf("0.0.0.0:%d", localAddr.Port))
-
-		go p.handleUDP(udpConn, conn)
+	tcpAddr := conn.LocalAddr().(*net.TCPAddr)
+	bindIP := tcpAddr.IP.String()
+	if bindIP == "::" || bindIP == "0.0.0.0" {
+		bindIP = "127.0.0.1"
 	}
+
+	udpAddr, _ := net.ResolveUDPAddr("udp", bindIP+":0")
+	udpConn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		sendReply(conn, 0x01, bindIP+":0")
+		return
+	}
+
+	localAddr := udpConn.LocalAddr().(*net.UDPAddr)
+	// fmt.Println("bindIP for UDP:", fmt.Sprintf("%s:%d", bindIP, localAddr.Port))
+
+	sendReply(conn, 0x00, fmt.Sprintf("%s:%d", bindIP, localAddr.Port))
+
+	go p.handleUDP(udpConn, conn)
 }
 
 func (p *Proxy) handleUDP(udpConn *net.UDPConn, tcpControlConn net.Conn) {
@@ -168,6 +174,7 @@ func (p *Proxy) handleUDP(udpConn *net.UDPConn, tcpControlConn net.Conn) {
 	for {
 		udpConn.SetReadDeadline(time.Now().Add(5 * time.Second))
 
+		// fmt.Println("reading UDP")
 		n, clientAddr, err := udpConn.ReadFromUDP(buf)
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
@@ -183,6 +190,7 @@ func (p *Proxy) handleUDP(udpConn *net.UDPConn, tcpControlConn net.Conn) {
 
 		target, payloadOffset, err := parseSocks5UDPHeader(buf[:n])
 		if err != nil {
+			fmt.Println("UDP Parse error:", err)
 			continue
 		}
 
@@ -230,6 +238,7 @@ func (p *Proxy) handleUDP(udpConn *net.UDPConn, tcpControlConn net.Conn) {
 				defer right.Close()
 				respBuf := make([]byte, 65535)
 				for {
+					// fmt.Println("reading responses")
 					rn, rerr := right.Read(respBuf)
 					if rerr != nil {
 						break
@@ -241,6 +250,8 @@ func (p *Proxy) handleUDP(udpConn *net.UDPConn, tcpControlConn net.Conn) {
 					if header == nil {
 						continue
 					}
+
+					// fmt.Println("writing to UDP")
 					udpConn.WriteToUDP(append(header, respBuf[:rn]...), clientAddr)
 				}
 
