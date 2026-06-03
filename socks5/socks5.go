@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/agnostic-t/neutrino-core/local"
 )
@@ -110,16 +111,21 @@ func (p *Proxy) handleInitConn(conn net.Conn) {
 	}
 
 	if reqProto == REQUEST_UDP {
-		udpAddr, _ := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+		udpAddr, _ := net.ResolveUDPAddr("udp", "0.0.0.0:0") // ИСПРАВЛЕНО
 		udpConn, err := net.ListenUDP("udp", udpAddr)
 		if err != nil {
 			sendReply(conn, 0x01, "0.0.0.0:0")
 			return
 		}
 
-		sendReply(conn, 0x00, udpConn.LocalAddr().String())
-
 		go p.handleUDP(udpConn, conn)
+
+		p.reqChan <- &Request{
+			conn:    conn,
+			target:  target,
+			proto:   "udp",
+			udpConn: udpConn,
+		}
 	}
 }
 
@@ -127,10 +133,33 @@ func (p *Proxy) handleUDP(udpConn *net.UDPConn, tcpControlConn net.Conn) {
 	defer udpConn.Close()
 	defer tcpControlConn.Close()
 
+	tcpClosed := make(chan struct{})
+	go func() {
+		defer close(tcpClosed)
+		buf := make([]byte, 1)
+
+		for {
+			_, err := tcpControlConn.Read(buf)
+			if err != nil {
+				return
+			}
+		}
+	}()
+
 	buf := make([]byte, 65535)
 	for {
+		udpConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+
 		n, clientAddr, err := udpConn.ReadFromUDP(buf)
 		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				select {
+				case <-tcpClosed:
+					return
+				default:
+					continue // timeout
+				}
+			}
 			return
 		}
 
@@ -272,9 +301,10 @@ func buildSocks5UDPHeader(target string) []byte {
 
 // Request implements local.Request
 type Request struct {
-	conn   net.Conn
-	target string
-	proto  string
+	conn    net.Conn
+	target  string
+	proto   string
+	udpConn net.Conn
 }
 
 func (r *Request) Target() string {
@@ -286,8 +316,17 @@ func (r *Request) Proto() string {
 }
 
 func (r *Request) Success(boundAddr string) (net.Conn, error) {
-	if err := sendReply(r.conn, 0x00, "0.0.0.0:0"); err != nil {
+	addr := boundAddr
+	if r.proto == "udp" && r.udpConn != nil {
+		addr = r.udpConn.LocalAddr().String()
+	}
+
+	if err := sendReply(r.conn, 0x00, addr); err != nil {
 		return nil, fmt.Errorf("reply error: %s, %w", r.conn.RemoteAddr(), err)
+	}
+
+	if r.proto == "udp" {
+		return nil, nil
 	}
 
 	return r.conn, nil
