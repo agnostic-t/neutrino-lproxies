@@ -297,7 +297,7 @@ func parseSocks5UDPHeader(buf []byte) (string, int, error) {
 		}
 		host = net.IP(buf[offset : offset+4]).String()
 		offset += 4
-		fmt.Println("Got IPv4 on UDP:", host)
+		// fmt.Println("Got IPv4 on UDP:", host)
 	case 0x03: // Domain Name: 1 byte length + domain name
 		if len(buf) < offset+1 {
 			return "", 0, fmt.Errorf("packet too short for Domain")
