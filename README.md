@@ -1,9 +1,18 @@
 ![[logo]](./assets/logo.png)
 
-# Neutrino project module
+English | [Русский](./README_RU.md)
 
-## Local core module implementation
+# Project Neutrino  
 
-Implements `lproxy` infteface from [neutrino-core](https://github.com/agnostic-t/neutrino-core)
+This repository belongs to the [Neutrino](https://github.com/agnostic-t/neutrino-core) project, it is the base implementation of the `local` module.
 
-Only SOCKS5 proxy available for now
+## Content
+
+Currently it contains implementations:
+
+- [socks5](./socks5/socks5.go): SOCKS5 proxy, supports CONNECT and UDP ASSOCIATE methods. It can be used in combination with TUN mode.
+
+Planned proxies:
+
+- `http`: HTTP proxy
+- `https`: HTTPS proxy
